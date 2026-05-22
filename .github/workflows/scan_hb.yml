@@ -1,4 +1,4 @@
-name:  快扫版
+name: scan_hb
 
 on:
   schedule:
