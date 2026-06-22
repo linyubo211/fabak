@@ -19,7 +19,10 @@ jobs:
 
       - name: Install dependencies
         run: pip install aiohttp
-
+      - name: 安装 Python 依赖库
+        run: |
+          pip install aiohttp tqdm
+          
       - name: Run Scanner
         run: python py/scan_hb_telecom.py
 
