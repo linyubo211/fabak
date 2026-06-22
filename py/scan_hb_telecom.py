@@ -3,106 +3,189 @@ import aiohttp
 import os
 import json
 import re
+import sys
+import warnings
+import random
+from tqdm import tqdm
 
-# --- 配置 ---
-TARGET_PREFIX = "221.232"
-TARGET_PORT = 7777
+# 屏蔽 Python 3.14+ 的弃用警告
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# --- 核心配置修改：支持不同网段对应不同端口 ---
+TARGET_CONFIG = {
+    "106.115: 9901,
+    "221.232: 7777,
+    "110.241: 808
+}
 CHECK_PATH = "/iptv/live/1000.json?key=txipt"
 M3U_FILE = "py/hb_telecom.m3u"
 TVBOX_FILE = "py/hb_telecom_tvbox.txt"
-HISTORY_FILE = "py/scanned_history.json" # 仅作为发现记录，不参与扫描过滤
-CONCURRENCY = 1000 
+HISTORY_FILE = "py/scanned_history.json"
+CONCURRENCY = 200 if sys.platform == 'win32' else 800  # 稍微平滑并发，防止被运营商丢包
+
+# 🚫 黑名单列表
+IP_BLACKLIST = [
+    "42.231.62.137", 
+    "42.231.1.1",
+]
 
 PROVINCIAL_LOGIC = ['浙江卫视', '湖南卫视', '东方卫视', '北京卫视', '江苏卫视', '江西卫视', '深圳卫视', '湖北卫视', '吉林卫视', '四川卫视', '天津卫视', '宁夏卫视', '安徽卫视', '山东卫视', '山西卫视', '广东卫视', '广西卫视', '东南卫视', '内蒙古卫视', '黑龙江卫视', '新疆卫视', '河北卫视', '河南卫视', '云南卫视', '海南卫视', '甘肃卫视', '西藏卫视', '贵州卫视', '辽宁卫视', '陕西卫视', '青海卫视', '康巴卫视', '三沙卫视', '大湾区卫视']
 
 def update_history_log(current_ips):
-    """对比并追加新发现的 IP ID"""
     existing_history = []
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 existing_history = json.load(f)
         except: pass
-    
-    # 找出本次扫描中，历史记录里没有的新 IP
-    new_ips = [ip for ip in current_ips if ip not in existing_history]
-    
+    new_ips = [ip for ip in current_ips if ip not in existing_history and ip not in IP_BLACKLIST]
     if new_ips:
         updated_history = list(set(existing_history + new_ips))
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(updated_history, f, indent=4, ensure_ascii=False)
-        print(f"📝 历史记录已更新，新增了 {len(new_ips)} 个新发现的 IP。")
-    else:
-        print("ℹ️ 本次未发现新的 IP ID。")
+        print(f"\n📝 历史记录已更新，新增了 {len(new_ips)} 个 IP。")
 
 def clean_and_weight(name):
     name_upper = name.upper().replace(" ", "").replace("-", "")
-    if "CCTV5+" in name_upper or "CCTV5体育赛事" in name_upper:
-        return "CCTV5+", 5.5
+    if "CCTV5+" in name_upper: return "CCTV5+", 5.5
     if "CCTV" in name_upper:
         match = re.search(r'CCTV(\d+)', name_upper)
-        if match:
-            num = match.group(1)
-            return f"CCTV{num}", int(num)
+        if match: return f"CCTV{match.group(1)}", int(match.group(1))
         return name, 99
-    for i, province in enumerate(PROVINCIAL_LOGIC):
-        if province in name:
-            return province, 100 + i 
-    if "卫视" in name:
-        return name, 200
+    for i, p in enumerate(PROVINCIAL_LOGIC):
+        if p in name: return p, 100 + i 
     return name, 999
 
-async def check_host_alive(semaphore, ip):
+# 修改探测函数：支持传入对应的 port
+async def check_host_alive(semaphore, ip, port, pbar):
     async with semaphore:
+        writer = None
         try:
-            fut = asyncio.open_connection(ip, TARGET_PORT)
-            reader, writer = await asyncio.wait_for(fut, timeout=1.0) # 缩短超时加快全量扫描
-            writer.close()
-            await writer.wait_closed()
-            return ip
-        except: return None
+            fut = asyncio.open_connection(ip, port)
+            reader, writer = await asyncio.wait_for(fut, timeout=2.5)  # 稍微宽容一点超时
+            return (ip, port)  # 成功后返回 IP 和端口元组
+        except:
+            return None
+        finally:
+            if writer:
+                try:
+                    writer.close()
+                except:
+                    pass
+            pbar.update(1)
 
-async def fetch_data(session, ip_list):
+# 修改获取数据函数：提取各自绑定的 port
+async def fetch_data(session, target_list):
     results = []
-    tasks = [session.get(f"http://{ip}:{TARGET_PORT}{CHECK_PATH}", timeout=5) for ip in ip_list]
-    responses = await asyncio.gather(*tasks, return_exceptions=True)
-    for i, resp in enumerate(responses):
-        if isinstance(resp, aiohttp.ClientResponse) and resp.status == 200:
-            try:
-                data = await resp.json(content_type=None)
-                if data.get("code") == 0:
-                    for item in data["data"]:
-                        clean_name, weight = clean_and_weight(item.get("name", ""))
-                        cat = "央视" if weight < 100 else ("卫视" if weight < 300 else "地方")
-                        results.append({
-                            "name": clean_name, "url": f"http://{ip_list[i]}:{TARGET_PORT}{item.get('url')}",
-                            "cat": cat, "weight": float(weight), "ip": ip_list[i]
-                        })
-            except: pass
+    fetch_limit = asyncio.Semaphore(5) 
+
+    async def fetch_single_ip(ip, port):
+        async with fetch_limit:
+            for attempt in range(3):
+                try:
+                    url = f"http://{ip}:{port}{CHECK_PATH}"
+                    async with session.get(url, timeout=10) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(content_type=None)
+                            if data.get("code") == 0 and "data" in data:
+                                chunk = []
+                                for item in data["data"]:
+                                    name = item.get("name", "")
+                                    raw_url = item.get("url", "")
+                                    chid = item.get("chid", "")
+                                    
+                                    # 根据该 IP 正确的端口进行拼接
+                                    if "tsfile" in raw_url.lower() or ".m3u8" in raw_url.lower():
+                                        final_url = f"http://{ip}:{port}{raw_url}"
+                                    else:
+                                        formatted_chid = str(chid).zfill(4)
+                                        final_url = f"http://{ip}:{port}/tsfile/live/{formatted_chid}_1.m3u8?key=txiptv&playlive=1&authid=0"
+
+                                    clean_name, weight = clean_and_weight(name)
+                                    cat = "央视" if weight < 100 else ("卫视" if weight < 300 else "地方")
+                                    chunk.append({
+                                        "name": clean_name,
+                                        "url": final_url,
+                                        "cat": cat,
+                                        "weight": float(weight),
+                                        "ip": ip
+                                    })
+                                print(f"✅ [成功] {ip}:{port} | 台数: {len(chunk)}")
+                                return chunk
+                except Exception:
+                    if attempt < 2:
+                        await asyncio.sleep(random.uniform(2, 5))
+                    continue
+            return []
+
+    tasks = [fetch_single_ip(target[0], target[1]) for target in target_list]
+    all_chunks = await asyncio.gather(*tasks)
+    for chunk in all_chunks:
+        results.extend(chunk)
     return results
 
 async def main():
-    # 1. 全量扫描 221.232.0.0/16
-    print(f"🚀 开始全量爆破 {TARGET_PREFIX}.x.y (不参考历史记录)...")
-    all_ips = [f"{TARGET_PREFIX}.{i}.{j}" for i in range(256) for j in range(256)]
-    semaphore = asyncio.Semaphore(CONCURRENCY)
-    alive_tasks = [check_host_alive(semaphore, ip) for ip in all_ips]
-    alive_ips = [res for res in await asyncio.gather(*alive_tasks) if res]
+    history_targets = []
+    # 读取历史记录，兼容旧版纯 IP 数组格式，默认赋予第一个网段端口或跳过
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                old_history = json.load(f)
+                for ip in old_history:
+                    # 识别历史 IP 属于哪个段，补全端口
+                    matched = False
+                    for prefix, port in TARGET_CONFIG.items():
+                        if ip.startswith(prefix):
+                            history_targets.append((ip, port))
+                            matched = True
+                            break
+                    if not matched:
+                        history_targets.append((ip, 8082)) # 兜底端口
+        except: pass
+
+    # 核心改动：生成带独立端口的任务元组列表 [(ip, port), ...]
+    scan_targets = []
+    for prefix, port in TARGET_CONFIG.items():
+        for i in range(256):
+            for j in range(256):
+                ip = f"{prefix}.{i}.{j}"
+                if ip not in IP_BLACKLIST:
+                    scan_targets.append((ip, port))
+
+    # 去重组合
+    all_targets = list(dict.fromkeys(history_targets + scan_targets))
     
-    print(f"📡 探测完成，当前共有 {len(alive_ips)} 个活跃服务器。")
+    if IP_BLACKLIST:
+        print(f"🛡️ 已从扫描列表中屏蔽 {len(IP_BLACKLIST)} 个黑名单 IP。")
+    
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    alive_targets = []
 
-    if alive_ips:
-        # 2. 抓取实时频道
+    print(f"🚀 开始探测 {len(all_targets)} 个目标（按段分配专属端口）")
+    with tqdm(total=len(all_targets), desc="🔍 扫描进度", unit="IP", colour="cyan") as pbar:
+        async def run_task(ip, port):
+            res = await check_host_alive(semaphore, ip, port, pbar)
+            if res:
+                alive_targets.append(res)
+
+        tasks = []
+        for ip, port in all_targets:
+            tasks.append(run_task(ip, port))
+            if len(tasks) >= 2000: 
+                await asyncio.gather(*tasks)
+                tasks = []
+        if tasks:
+            await asyncio.gather(*tasks)
+    
+    print(f"\n📡 探测完成，共找到 {len(alive_targets)} 个活跃服务器。")
+
+    if alive_targets:
         async with aiohttp.ClientSession() as session:
-            all_channels = await fetch_data(session, alive_ips)
-
+            all_channels = await fetch_data(session, alive_targets)
         if all_channels:
-            # 排序
-            cat_order = {"央视": 0, "卫视": 1, "地方": 2}
-            all_channels.sort(key=lambda x: (cat_order.get(x['cat'], 3), x['weight'], x['name']))
-
-            # 3. 输出文件 (全量覆盖)
+            all_channels.sort(key=lambda x: ({"央视":0,"卫视":1,"地方":2}.get(x['cat'],3), x['weight'], x['name']))
             os.makedirs("py", exist_ok=True)
+            
             with open(M3U_FILE, "w", encoding="utf-8") as f:
                 f.write("#EXTM3U\n")
                 for ch in all_channels:
@@ -115,14 +198,14 @@ async def main():
                 for cat in ["央视", "卫视", "地方"]:
                     if cat in cat_dict:
                         f.write(f"{cat},#genre#\n" + "\n".join(cat_dict[cat]) + "\n")
-
-            # 4. 最后一步：更新发现记录
-            current_success_ips = list(set([ch['ip'] for ch in all_channels]))
-            update_history_log(current_success_ips)
             
-            print(f"✅ 处理完成。M3U/TXT 已生成，条数: {len(all_channels)}")
+            update_history_log(list(set([ch['ip'] for ch in all_channels])))
+            print(f"✅ 任务成功！生成源条数: {len(all_channels)}")
     else:
-        print("❌ 未发现任何活跃源。")
+        print("❌ 未发现任何有效直播源。")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 已由用户手动停止。")
