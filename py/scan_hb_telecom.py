@@ -11,7 +11,7 @@ from tqdm import tqdm
 # 屏蔽 Python 3.14+ 的弃用警告
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# --- 核心配置修改：支持不同网段对应不同端口 ---
+# --- 核心配置：支持不同网段对应不同端口 ---
 TARGET_CONFIG = {
     "221.232":7777
 }
@@ -19,7 +19,8 @@ CHECK_PATH = "/iptv/live/1000.json?key=txipt"
 M3U_FILE = "py/hb_telecom.m3u"
 TVBOX_FILE = "py/hb_telecom_tvbox.txt"
 HISTORY_FILE = "py/scanned_history.json"
-CONCURRENCY = 200 if sys.platform == 'win32' else 800  # 稍微平滑并发，防止被运营商丢包
+# GitHub Actions 环境保持 800 并发，兼顾速度与稳定性，防止因瞬间并发太高被运营商防火墙丢包
+CONCURRENCY = 200 if sys.platform == 'win32' else 800  
 
 # 🚫 黑名单列表
 IP_BLACKLIST = [
@@ -54,14 +55,18 @@ def clean_and_weight(name):
         if p in name: return p, 100 + i 
     return name, 999
 
-# 修改探测函数：支持传入对应的 port
+# 修改探测函数：只要 TCP 握手成功，利用 tqdm.write 实时向控制台输出日志
 async def check_host_alive(semaphore, ip, port, pbar):
     async with semaphore:
         writer = None
         try:
             fut = asyncio.open_connection(ip, port)
-            reader, writer = await asyncio.wait_for(fut, timeout=2.5)  # 稍微宽容一点超时
-            return (ip, port)  # 成功后返回 IP 和端口元组
+            reader, writer = await asyncio.wait_for(fut, timeout=2.5)  # 适当放宽超时，保障稳定性
+            
+            # 📢 实时日志改进：只要对应端口有反应，立即打印（不会破坏 tqdm 进度条结构）
+            tqdm.write(f"📡 [发现响应] {ip}:{port} 端口处于开放状态，准备抓取数据...")
+            
+            return (ip, port)
         except:
             return None
         finally:
@@ -72,7 +77,7 @@ async def check_host_alive(semaphore, ip, port, pbar):
                     pass
             pbar.update(1)
 
-# 修改获取数据函数：提取各自绑定的 port
+# 获取数据函数：提取各自网段绑定的独立 port 拼接 URL
 async def fetch_data(session, target_list):
     results = []
     fetch_limit = asyncio.Semaphore(5) 
@@ -92,7 +97,7 @@ async def fetch_data(session, target_list):
                                     raw_url = item.get("url", "")
                                     chid = item.get("chid", "")
                                     
-                                    # 根据该 IP 正确的端口进行拼接
+                                    # 根据当前 IP 的专属端口进行拼接
                                     if "tsfile" in raw_url.lower() or ".m3u8" in raw_url.lower():
                                         final_url = f"http://{ip}:{port}{raw_url}"
                                     else:
@@ -108,7 +113,7 @@ async def fetch_data(session, target_list):
                                         "weight": float(weight),
                                         "ip": ip
                                     })
-                                print(f"✅ [成功] {ip}:{port} | 台数: {len(chunk)}")
+                                print(f"✅ [成功提取数据] {ip}:{port} | 频道总数: {len(chunk)}")
                                 return chunk
                 except Exception:
                     if attempt < 2:
@@ -124,13 +129,12 @@ async def fetch_data(session, target_list):
 
 async def main():
     history_targets = []
-    # 读取历史记录，兼容旧版纯 IP 数组格式，默认赋予第一个网段端口或跳过
+    # 读取历史记录并智能匹配旧数据的端口号
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 old_history = json.load(f)
                 for ip in old_history:
-                    # 识别历史 IP 属于哪个段，补全端口
                     matched = False
                     for prefix, port in TARGET_CONFIG.items():
                         if ip.startswith(prefix):
@@ -138,10 +142,10 @@ async def main():
                             matched = True
                             break
                     if not matched:
-                        history_targets.append((ip, 8082)) # 兜底端口
+                        history_targets.append((ip, 8082))  # 默认兜底端口
         except: pass
 
-    # 核心改动：生成带独立端口的任务元组列表 [(ip, port), ...]
+    # 生成带独立端口的任务列表
     scan_targets = []
     for prefix, port in TARGET_CONFIG.items():
         for i in range(256):
@@ -150,7 +154,7 @@ async def main():
                 if ip not in IP_BLACKLIST:
                     scan_targets.append((ip, port))
 
-    # 去重组合
+    # 合并、去重
     all_targets = list(dict.fromkeys(history_targets + scan_targets))
     
     if IP_BLACKLIST:
@@ -159,23 +163,19 @@ async def main():
     semaphore = asyncio.Semaphore(CONCURRENCY)
     alive_targets = []
 
-    print(f"🚀 开始探测 {len(all_targets)} 个目标（按段分配专属端口）")
+    print(f"🚀 开始探测 {len(all_targets)} 个目标（按网段动态分配对应端口）")
+    
+    # 📢 流式并发改进：使用 asyncio.gather 配合内部信号量做到实时产生日志，不再批量憋着
     with tqdm(total=len(all_targets), desc="🔍 扫描进度", unit="IP", colour="cyan") as pbar:
         async def run_task(ip, port):
             res = await check_host_alive(semaphore, ip, port, pbar)
             if res:
                 alive_targets.append(res)
 
-        tasks = []
-        for ip, port in all_targets:
-            tasks.append(run_task(ip, port))
-            if len(tasks) >= 2000: 
-                await asyncio.gather(*tasks)
-                tasks = []
-        if tasks:
-            await asyncio.gather(*tasks)
+        tasks = [run_task(ip, port) for ip, port in all_targets]
+        await asyncio.gather(*tasks)
     
-    print(f"\n📡 探测完成，共找到 {len(alive_targets)} 个活跃服务器。")
+    print(f"\n📡 探测完成，共找到 {len(alive_targets)} 个有响应的服务器，开始进入接口抓取环节...")
 
     if alive_targets:
         async with aiohttp.ClientSession() as session:
@@ -198,9 +198,9 @@ async def main():
                         f.write(f"{cat},#genre#\n" + "\n".join(cat_dict[cat]) + "\n")
             
             update_history_log(list(set([ch['ip'] for ch in all_channels])))
-            print(f"✅ 任务成功！生成源条数: {len(all_channels)}")
+            print(f"✅ 任务成功！生成有效源总条数: {len(all_channels)}")
     else:
-        print("❌ 未发现任何有效直播源。")
+        print("❌ 未发现任何有响应的活跃直播源。")
 
 if __name__ == "__main__":
     try:
