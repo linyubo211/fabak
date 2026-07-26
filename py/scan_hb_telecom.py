@@ -13,7 +13,6 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # --- 核心配置：支持不同网段对应不同端口 ---
 TARGET_CONFIG = {
-    "221.232":7777,
     "219.140":7777,		
     "59.174":7777,		
     "111.4":8008,   
